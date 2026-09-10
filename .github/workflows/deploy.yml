@@ -147,7 +147,9 @@ jobs:
               if ($up) { $listening = $true; break }
             }
             if ($listening) { break }
-            Write-Host "  attempt $attempt: ports not ready yet"
+            # Note: "$attempt:" would be parsed as a scope/drive qualifier
+            # (like $env:PATH), so the variable must be delimited explicitly.
+            Write-Host "  attempt $($attempt): ports not ready yet"
           }
 
           if (-not $listening) {
