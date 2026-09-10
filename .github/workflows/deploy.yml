@@ -108,8 +108,23 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $repo  = "C:\deploy-gateway"
           $ports = @(443, 80)
+
+          # schtasks /end only terminates the PowerShell host that the task
+          # launched; the node.exe it spawned keeps running and keeps holding
+          # 443/80. So kill by port ownership first, otherwise the new instance
+          # cannot bind and the deploy fails on the port wait below.
+          foreach ($port in $ports) {
+            $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+            foreach ($c in $conns) {
+              $targetPid = $c.OwningProcess
+              if ($targetPid -and $targetPid -ne 0) {
+                Write-Host "Stopping PID $targetPid holding port $port"
+                Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue
+              }
+            }
+          }
+          Start-Sleep -Seconds 3
 
           Write-Host "Ending scheduled task Gateway-App..."
           & schtasks /end /tn "Gateway-App" 2>$null | Out-Null
