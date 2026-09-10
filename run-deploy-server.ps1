@@ -49,7 +49,8 @@ if (-not (Test-Path $LogDir)) {
 # ---- Helper: Find process by PID file ----
 function Get-AppProcess {
     if (Test-Path $PidFile) {
-        $savedPid = (Get-Content $PidFile -Raw).Trim()
+        # Tolerate legacy UTF-16 PID files: strip BOM and non-digits.
+        $savedPid = ((Get-Content $PidFile -Raw) -replace "[^0-9]", "").Trim()
         if ($savedPid -match '^\d+$') {
             try {
                 $proc = Get-Process -Id ([int]$savedPid) -ErrorAction SilentlyContinue
@@ -102,17 +103,22 @@ function Start-App {
         return
     }
 
-    $cmdArgs = "/c `"set NODE_ENV=production&&`"$NodeExe`" `"$ServerFile`"`""
-    $proc = Start-Process -FilePath "cmd.exe" `
-        -ArgumentList $cmdArgs `
+    # Launch node directly (no cmd.exe shim). A cmd wrapper added an extra
+    # link to the parent chain: when the scheduled-task host exited, cmd.exe
+    # was torn down and took the gateway with it, silently dropping 80/443.
+    $env:NODE_ENV = "production"
+    $proc = Start-Process -FilePath $NodeExe `
+        -ArgumentList @("`"$ServerFile`"") `
         -WorkingDirectory $DeployDir `
         -NoNewWindow `
         -PassThru `
         -RedirectStandardOutput $LogFile `
         -RedirectStandardError $ErrFile
 
+    Remove-Item Env://NODE_ENV -ErrorAction SilentlyContinue
+
     # Save PID
-    $proc.Id | Out-File -FilePath $PidFile -NoNewline
+    $proc.Id | Out-File -FilePath $PidFile -NoNewline -Encoding ascii
 
     # Wait for the HTTPS port to come up (startup is not instant)
     $listening = $false
@@ -152,14 +158,9 @@ function Stop-App {
 
     Write-Host "Stopping $AppName (PID: $($proc.Id))..." -ForegroundColor Cyan
 
-    # The gateway handles SIGINT/SIGTERM for a graceful shutdown.
-    $proc.CloseMainWindow() | Out-Null
-    Start-Sleep -Seconds 3
-
-    if (-not $proc.HasExited) {
-        Write-Host "  Force killing process..." -ForegroundColor Yellow
-        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-    }
+    # node has no window, so CloseMainWindow() is a no-op; terminate by PID.
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
 
     # Verify both ports are freed
     Start-Sleep -Seconds 1
