@@ -1,0 +1,22 @@
+{
+  "name": "lzgo-gateway",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "LZGO gateway: TLS termination + multi-domain reverse proxy",
+  "scripts": {
+    "dev": "tsx gateway.ts",
+    "build": "esbuild gateway.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=gateway.cjs",
+    "start": "node gateway.cjs",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2"
+  }
+}

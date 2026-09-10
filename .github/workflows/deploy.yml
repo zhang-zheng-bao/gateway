@@ -1,0 +1,187 @@
+name: Deploy Gateway
+
+# Self-hosted runner on the Tencent Cloud Windows box.
+# Runner name: gw-win   Labels: self-hosted, Windows, X64
+#
+# IMPORTANT: keep the entire script body ASCII-only.
+# The Windows runner writes the step script to a temp .ps1 file and reads it
+# back using the system ANSI code page (GBK). Non-ASCII characters get mangled
+# and produce bogus PowerShell parser errors such as
+#   TerminatorExpectedAtEndOfString
+# Comments are in English on purpose. Do not "helpfully" translate them.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: gateway-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 15
+
+    steps:
+      - name: Fetch latest code
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo = "C:\deploy-gateway"
+          $git  = "C:\Program Files\Git\bin\git.exe"
+
+          Set-Location $repo
+          Write-Host "Fetching origin/main..."
+
+          & $git fetch origin main
+          if ($LASTEXITCODE -ne 0) { throw "git fetch failed with exit code $LASTEXITCODE" }
+
+          & $git reset --hard origin/main
+          if ($LASTEXITCODE -ne 0) { throw "git reset failed with exit code $LASTEXITCODE" }
+
+          $rev = & $git rev-parse --short HEAD
+          Write-Host "Now at commit: $rev"
+          Write-Host "Files protected by .gitignore (.env, certs/) are untouched."
+
+      - name: Install dependencies
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo = "C:\deploy-gateway"
+          $npm  = "C:\Program Files\nodejs\npm.cmd"
+
+          Set-Location $repo
+
+          # Only run npm ci when package-lock.json actually changed.
+          $lock    = Join-Path $repo "package-lock.json"
+          $cacheDir = "C:\actions-runner-gw\.cache"
+          if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
+          $hashFile = Join-Path $cacheDir "gateway-deps-hash.txt"
+
+          $newHash = (Get-FileHash $lock -Algorithm SHA256).Hash
+          $oldHash = ""
+          if (Test-Path $hashFile) { $oldHash = (Get-Content $hashFile -Raw).Trim() }
+
+          if ($newHash -eq $oldHash -and (Test-Path (Join-Path $repo "node_modules"))) {
+            Write-Host "package-lock.json unchanged - skipping npm ci"
+          } else {
+            Write-Host "Installing dependencies..."
+            & $npm ci --no-audit --no-fund
+            if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE" }
+            $newHash | Out-File -FilePath $hashFile -Encoding ascii -NoNewline
+            Write-Host "Dependency hash updated."
+          }
+
+      - name: Build gateway bundle
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo = "C:\deploy-gateway"
+          $npm  = "C:\Program Files\nodejs\npm.cmd"
+
+          Set-Location $repo
+          Write-Host "Building gateway.cjs..."
+          & $npm run build
+          if ($LASTEXITCODE -ne 0) { throw "npm run build failed with exit code $LASTEXITCODE" }
+
+          $out = Join-Path $repo "gateway.cjs"
+          if (-not (Test-Path $out)) { throw "build did not produce gateway.cjs" }
+          $size = [math]::Round((Get-Item $out).Length / 1KB, 1)
+          Write-Host "Build OK: gateway.cjs ($size KB)"
+
+      - name: Verify certificates are present
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $certDir = "C:\deploy-gateway\certs"
+          if (-not (Test-Path $certDir)) { throw "certificate directory missing: $certDir" }
+
+          $pems = Get-ChildItem -Path $certDir -Recurse -Filter "cert.pem"
+          if (-not $pems -or $pems.Count -eq 0) { throw "no cert.pem found under $certDir" }
+
+          Write-Host "Found $($pems.Count) certificate(s):"
+          foreach ($p in $pems) { Write-Host "  $($p.Directory.Name)" }
+
+      - name: Restart gateway
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo  = "C:\deploy-gateway"
+          $ports = @(443, 80)
+
+          Write-Host "Ending scheduled task Gateway-App..."
+          & schtasks /end /tn "Gateway-App" 2>$null | Out-Null
+          Start-Sleep -Seconds 2
+
+          # schtasks /run returns immediately, so poll until the ports are
+          # actually listening instead of sleeping a fixed amount.
+          $listening = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Write-Host "Launching scheduled task Gateway-App (attempt $attempt)..."
+            & schtasks /run /tn "Gateway-App" | Out-Null
+
+            for ($i = 1; $i -le 12; $i++) {
+              Start-Sleep -Seconds 2
+              $up = $true
+              foreach ($port in $ports) {
+                $c = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+                if (-not $c) { $up = $false; break }
+              }
+              if ($up) { $listening = $true; break }
+            }
+            if ($listening) { break }
+            Write-Host "  attempt $attempt: ports not ready yet"
+          }
+
+          if (-not $listening) {
+            throw "gateway did not come up on ports: $($ports -join ', ')"
+          }
+          Write-Host "Ports are listening."
+
+      - name: Health check
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Local gateway health endpoint..."
+          $ok = $false
+          for ($i = 1; $i -le 10; $i++) {
+            try {
+              $r = Invoke-RestMethod -Uri "http://localhost/__gateway/health" -TimeoutSec 5
+              Write-Host "  OK - uptime $($r.uptime)s, routes: $($r.routes -join ', ')"
+              $ok = $true
+              break
+            } catch {
+              Write-Host "  attempt $i failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds 2
+            }
+          }
+          if (-not $ok) { throw "local gateway health check failed" }
+
+          # Public checks through the gateway. TLS hiccups should not fail the
+          # deploy, so these are informational.
+          foreach ($url in @("https://luzhougo.cn/health", "https://zhengbao.work/health")) {
+            try {
+              $resp = Invoke-WebRequest -Uri $url -TimeoutSec 15 -UseBasicParsing
+              Write-Host "  $url -> HTTP $($resp.StatusCode)"
+            } catch {
+              Write-Host "  $url -> WARNING: $($_.Exception.Message)"
+            }
+          }
+
+      - name: Deploy summary
+        shell: powershell
+        run: |
+          $repo = "C:\deploy-gateway"
+          $git  = "C:\Program Files\Git\bin\git.exe"
+          Set-Location $repo
+          $rev = & $git rev-parse --short HEAD
+          $msg = & $git log -1 --pretty=%s
+          Write-Host "============================================"
+          Write-Host " Gateway deploy complete"
+          Write-Host " Commit : $rev"
+          Write-Host " Message: $msg"
+          Write-Host " Ports  : 80, 443"
+          Write-Host "============================================"
