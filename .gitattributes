@@ -1,0 +1,18 @@
+# 统一换行符策略，避免 Windows 上 checkout 出 CRLF 导致
+# 「服务器端文件与本地不一致」的假警报（曾真实发生：md5 不同，
+# 但归一化后完全一致，纯属换行符差异）。
+
+* text=auto eol=lf
+
+# 明确按二进制处理，禁止任何换行转换
+*.pem text eol=lf
+*.key text eol=lf
+*.pfx binary
+
+# 脚本类：仓库内存 LF，避免 runner 读取时的编码/换行噪声
+*.ps1 text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.ts text eol=lf
+*.json text eol=lf
+*.md text eol=lf
